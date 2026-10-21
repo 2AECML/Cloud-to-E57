@@ -1,0 +1,58 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Platforms>AnyCPU;x64</Platforms>
+    <AllowUnsafeBlocks>False</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Enums.NET" Version="5.0.0" />
+    <PackageReference Include="MathNet.Spatial" Version="0.6.0" />
+    <PackageReference Include="OpenCvSharp4" Version="4.10.0.20241108" />
+    <PackageReference Include="OpenCvSharp4.Extensions" Version="4.10.0.20241108" />
+    <PackageReference Include="OpenCvSharp4.runtime.win" Version="4.10.0.20241108" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="Interop.IQOPENLib">
+      <HintPath>..\Interop.IQOPENLib.dll</HintPath>
+    </Reference>
+    <Reference Include="Interop.LSSDKLib">
+      <HintPath>..\Interop.LSSDKLib.dll</HintPath>
+    </Reference>
+    <Reference Include="zfs_sdk_ref">
+      <HintPath>..\zfs_sdk_ref.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Keep the existing vendor runtime files in place, but deploy them beside
+         the x64 executable so zfs_sdk_ref.dll can resolve its native dependency
+         after a clean build. -->
+    <None Update="dll\zfs.dll">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <TargetPath>zfs.dll</TargetPath>
+    </None>
+    <None Update="dll\zfs.ini">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <TargetPath>zfs.ini</TargetPath>
+    </None>
+    <None Update="dll\zftools.dll">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <TargetPath>zftools.dll</TargetPath>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="native\x64\EasyTryE57Native.dll">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <TargetPath>EasyTryE57Native.dll</TargetPath>
+    </None>
+  </ItemGroup>
+
+</Project>

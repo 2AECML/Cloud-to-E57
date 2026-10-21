@@ -1,0 +1,70 @@
+# Visual Studio / IDE local state
+.vs/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+ipch/
+
+# .NET build, publish and test output (including nested test projects)
+[Bb]in/
+[Oo]bj/
+[Aa]rtifacts/
+[Pp]ublish/
+[Tt]est[Rr]esults/
+*.pdb
+*.coverage
+*.coveragexml
+
+# Native E57 dependency downloads, sources and build output
+/Native/.build-e57/
+/EasyTry/native/x64/EasyTryE57Native.dll
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+CMakeUserPresets.json
+*.obj
+*.pch
+*.ilk
+*.exp
+*.tlog
+
+# Keep vendor SDK DLLs and zfs.ini: they are project dependencies.
+# Do not add blanket *.dll, *.exe or *.ini rules.
+
+# Local SDK credentials and environment settings
+sdk.private.json
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Raw scans and generated E57 output (FLS can also be a directory)
+*.zfs
+*.fls
+*.fws
+*.e57
+*_dataset/
+*_扫描说明.txt
+
+# Runtime logs and temporary files
+logs/
+*.log
+*.tmp
+*.temp
+*.bak
+*~
+
+# Local backups and Visual Studio upgrade reports
+/Backup/
+/UpgradeLog*.htm
+/UpgradeLog*.xml
+/_UpgradeReport_Files/
+
+# Windows / macOS file explorer metadata
+Thumbs.db
+Desktop.ini
+.DS_Store
