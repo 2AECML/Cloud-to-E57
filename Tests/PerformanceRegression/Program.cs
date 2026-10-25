@@ -24,6 +24,7 @@ if (args.Length == 2 && args[0] == "--writer-benchmark")
 }
 if (result.WriterAllocatedBytes > 4 * 1024 * 1024) throw new Exception("Writer allocations grow with batch count instead of reusing buffers.");
 var checks = await SchedulerChecks.Run(root);
+checks += await ThreadAffinityChecks.Run(root);
 checks += await WriterChecks.ConcurrentConversions(root);
 checks += WriterChecks.CancellationAndCapacity(root);
 Console.WriteLine($"PASS: {checks + 2} performance regression checks; every decoded field of {result.Points:N0} benchmark points matched. Only generated fixtures were converted.");
@@ -155,6 +156,89 @@ static class WriterChecks
 }
 
 sealed record WriterBenchmarkResult(int Batches, int Rows, int Columns, long Points, double WriteSeconds, long WriterAllocatedBytes, int[] GcCollections, long OutputBytes, bool AllDecodedFieldsMatched);
+
+static class ThreadAffinityChecks
+{
+    internal static async Task<int> Run(string root)
+    {
+        var checks = 0;
+        foreach (var vendor in new[] { ScannerVendor.Faro, ScannerVendor.Auto, ScannerVendor.ZPlusF })
+        {
+            var calls = new List<(string Stage, int Thread, ApartmentState Apartment, bool Pool)>();
+            void Record(string stage) => calls.Add((stage, Environment.CurrentManagedThreadId, Thread.CurrentThread.GetApartmentState(), Thread.CurrentThread.IsThreadPoolThread));
+            var service = new PointCloudConversionService(_ => new AffinitySource(Record), () => new AffinityWriter(Record));
+            await service.ConvertAsync(new ConversionOptions
+            {
+                InputFilePath = Path.Combine(root, vendor + (vendor == ScannerVendor.ZPlusF ? ".zfs" : ".fls")),
+                OutputFilePath = Path.Combine(root, $"affinity-{vendor}.e57"), Vendor = vendor
+            }, null, CancellationToken.None);
+            if (!calls.Select(call => call.Stage).SequenceEqual(new[] { "source-open", "writer-open", "read", "write", "complete", "writer-dispose", "source-dispose" }))
+                throw new Exception("Source and writer lifecycle was not completed in order.");
+            checks++;
+            var expectedApartment = vendor == ScannerVendor.ZPlusF ? ApartmentState.MTA : ApartmentState.STA;
+            if (calls.Any(call => call.Apartment != expectedApartment) || calls.Select(call => call.Thread).Distinct().Count() != 1)
+                throw new Exception("SDK construction, reads and disposal must stay on one thread with the correct apartment.");
+            checks++;
+            if (calls.Any(call => call.Pool != (vendor == ScannerVendor.ZPlusF))) throw new Exception("FARO must use a dedicated thread; ZFS must retain its pool worker.");
+            checks++;
+        }
+        var created = false;
+        var cancelledService = new PointCloudConversionService(_ => { created = true; throw new Exception("Should not construct a source."); }, () => throw new Exception());
+        var cancellationOptions = new ConversionOptions { InputFilePath = Path.Combine(root, "cancel-affinity.fls"), OutputFilePath = Path.Combine(root, "cancel-affinity.e57"), Vendor = ScannerVendor.Faro };
+        using (var cancelled = new CancellationTokenSource())
+        {
+            cancelled.Cancel();
+            var task = cancelledService.ConvertAsync(cancellationOptions, null, cancelled.Token);
+            try { await task; throw new Exception("Pre-cancellation was ignored."); }
+            catch (OperationCanceledException) { if (created || !task.IsCanceled) throw new Exception("Pre-cancelled conversions must not create SDK objects."); checks++; }
+        }
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var disposed = new ConcurrentBag<string>();
+        using (var cancellation = new CancellationTokenSource())
+        {
+            var service = new PointCloudConversionService(_ => new AffinitySource(disposed.Add, token =>
+            {
+                entered.TrySetResult();
+                token.WaitHandle.WaitOne();
+                token.ThrowIfCancellationRequested();
+            }), () => new AffinityWriter(disposed.Add));
+            var task = service.ConvertAsync(cancellationOptions, null, cancellation.Token);
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            cancellation.Cancel();
+            try { await task; throw new Exception("In-flight cancellation was ignored."); }
+            catch (OperationCanceledException)
+            {
+                if (!task.IsCanceled || !disposed.Contains("source-dispose") || !disposed.Contains("writer-dispose"))
+                    throw new Exception("Cancellation returned before source and writer cleanup.");
+                checks++;
+            }
+        }
+        var failure = new InvalidOperationException("STA failure fixture");
+        var failing = new PointCloudConversionService(_ => throw failure, () => throw new Exception());
+        try { await failing.ConvertAsync(cancellationOptions, null, CancellationToken.None); throw new Exception("STA failure was swallowed."); }
+        catch (InvalidOperationException error) { if (!ReferenceEquals(error, failure)) throw new Exception("STA failure type/identity changed."); checks++; }
+        return checks;
+    }
+
+    private sealed class AffinitySource(Action<string> record, Action<CancellationToken>? beforeRead = null) : IScanSource
+    {
+        public ScanMetadata Metadata { get; private set; } = new("", ScannerVendor.Faro, 1, 1);
+        public void Open(ConversionOptions options, CancellationToken token) { record("source-open"); Metadata = Metadata with { SourceFilePath = options.InputFilePath }; }
+        public IEnumerable<PointBatch> ReadBatches(int size, CancellationToken token)
+        {
+            record("read"); beforeRead?.Invoke(token);
+            yield return new PointBatch(0, 1, 1, 0, [WriterChecks.Point(0, 0)]);
+        }
+        public void Dispose() => record("source-dispose");
+    }
+    private sealed class AffinityWriter(Action<string> record) : IPointCloudWriter
+    {
+        public void Open(ScanMetadata metadata, ConversionOptions options) => record("writer-open");
+        public void WriteBatch(PointBatch batch, CancellationToken token) => record("write");
+        public void Complete(ConversionReport report) => record("complete");
+        public void Dispose() => record("writer-dispose");
+    }
+}
 
 sealed class FixtureSource : IScanSource
 {
