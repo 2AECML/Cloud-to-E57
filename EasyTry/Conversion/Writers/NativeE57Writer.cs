@@ -15,11 +15,16 @@ public readonly record struct E57ValidationResult(
 public sealed class NativeE57Writer : IPointCloudWriter
 {
     private const int ScanLinesPerBatch = 64;
+    // libE57Format's E57XmlParser initializes/terminates global Xerces state.
+    // Its readers explicitly do not support simultaneous initialization.
+    private static readonly object ValidationLock = new();
     private IntPtr handle;
     private string? temporaryPath;
     private string? outputPath;
     private long writtenPointCount;
     private bool completed;
+    private int bufferCapacity;
+    private WriteBuffers? buffers;
 
     public static string? GetAvailabilityError()
     {
@@ -48,20 +53,23 @@ public sealed class NativeE57Writer : IPointCloudWriter
     public static E57ValidationResult ValidateFile(string filePath, bool readAllPoints)
     {
         var fullPath = Path.GetFullPath(filePath);
-        if (NativeE57Methods.easytry_e57_validate(
-                fullPath,
-                readAllPoints ? 1 : 0,
-                out var pointCount,
-                out var fieldMask) == 0)
+        lock (ValidationLock)
         {
-            throw CreateNativeException("E57 回读校验失败");
-        }
+            if (NativeE57Methods.easytry_e57_validate(
+                    fullPath,
+                    readAllPoints ? 1 : 0,
+                    out var pointCount,
+                    out var fieldMask) == 0)
+            {
+                throw CreateNativeException("E57 回读校验失败");
+            }
 
-        return new E57ValidationResult(
-            pointCount,
-            fieldMask,
-            (fieldMask & NativeE57Methods.RequiredFieldMask) ==
-            NativeE57Methods.RequiredFieldMask);
+            return new E57ValidationResult(
+                pointCount,
+                fieldMask,
+                (fieldMask & NativeE57Methods.RequiredFieldMask) ==
+                NativeE57Methods.RequiredFieldMask);
+        }
     }
 
     public void Open(ScanMetadata metadata, ConversionOptions options)
@@ -132,6 +140,7 @@ public sealed class NativeE57Writer : IPointCloudWriter
             }
         }
         var description = string.Join("; ", descriptionFields);
+        bufferCapacity = checked(metadata.ScanRows * ScanLinesPerBatch);
         handle = NativeE57Methods.easytry_e57_create(
             temporaryPath,
             Guid.NewGuid().ToString("D"),
@@ -140,7 +149,7 @@ public sealed class NativeE57Writer : IPointCloudWriter
             description,
             checked((uint)metadata.ScanRows),
             checked((uint)metadata.ScanColumns),
-            checked((nuint)((long)metadata.ScanRows * ScanLinesPerBatch)));
+            checked((nuint)bufferCapacity));
 
         if (handle == IntPtr.Zero)
         {
@@ -164,13 +173,23 @@ public sealed class NativeE57Writer : IPointCloudWriter
             return;
         }
 
-        var x = new double[count];
-        var y = new double[count];
-        var z = new double[count];
-        var processedIntensity = new float[count];
-        var rawIntensity = new double[count];
-        var rowIndex = new uint[count];
-        var columnIndex = new uint[count];
+        if (count > bufferCapacity)
+        {
+            throw new ArgumentException(
+                $"点批次包含 {count:N0} 个点，超过写入缓冲区容量 {bufferCapacity:N0}。",
+                nameof(batch));
+        }
+
+        // Reuse all seven arrays for the lifetime of this writer. Native code
+        // consumes only count elements, including for a smaller final batch.
+        var currentBuffers = buffers ??= new WriteBuffers(bufferCapacity);
+        var x = currentBuffers.X;
+        var y = currentBuffers.Y;
+        var z = currentBuffers.Z;
+        var processedIntensity = currentBuffers.ProcessedIntensity;
+        var rawIntensity = currentBuffers.RawIntensity;
+        var rowIndex = currentBuffers.RowIndex;
+        var columnIndex = currentBuffers.ColumnIndex;
 
         for (var index = 0; index < count; index++)
         {
@@ -300,6 +319,8 @@ public sealed class NativeE57Writer : IPointCloudWriter
 
     private void ReleaseNativeHandle()
     {
+        buffers = null;
+        bufferCapacity = 0;
         if (handle == IntPtr.Zero)
         {
             return;
@@ -307,6 +328,17 @@ public sealed class NativeE57Writer : IPointCloudWriter
 
         NativeE57Methods.easytry_e57_destroy(handle);
         handle = IntPtr.Zero;
+    }
+
+    private sealed class WriteBuffers(int capacity)
+    {
+        public double[] X { get; } = new double[capacity];
+        public double[] Y { get; } = new double[capacity];
+        public double[] Z { get; } = new double[capacity];
+        public float[] ProcessedIntensity { get; } = new float[capacity];
+        public double[] RawIntensity { get; } = new double[capacity];
+        public uint[] RowIndex { get; } = new uint[capacity];
+        public uint[] ColumnIndex { get; } = new uint[capacity];
     }
 
     private void DeleteTemporaryFile()

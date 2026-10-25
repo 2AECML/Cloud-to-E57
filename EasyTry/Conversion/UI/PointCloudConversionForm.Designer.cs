@@ -1,4 +1,5 @@
 #nullable enable
+using EasyTry.Conversion.Services;
 
 namespace EasyTry.Conversion.UI;
 
@@ -18,6 +19,7 @@ partial class PointCloudConversionForm
     private ComboBox outputModeComboBox = null!;
     private Label segmentColumnsLabel = null!;
     private NumericUpDown segmentColumnsNumeric = null!;
+    private NumericUpDown parallelTasksNumeric = null!;
     private GroupBox progressGroup = null!;
     private ProgressBar conversionProgressBar = null!;
     private Label statusLabel = null!;
@@ -164,25 +166,20 @@ partial class PointCloudConversionForm
         layout.Controls.Add(segmentColumnsLabel, 2, 1);
         layout.Controls.Add(segmentColumnsNumeric, 3, 1);
 
-        var rawIntensity = new CheckBox
+        parallelTasksNumeric = new NumericUpDown
         {
-            AutoSize = true,
-            Checked = true,
-            Enabled = false,
-            Text = "保留原始强度（固定）",
-            Margin = new Padding(3, 8, 3, 3)
+            Minimum = 1,
+            Maximum = BatchConversionScheduler.MaximumConcurrency,
+            Value = BatchConversionScheduler.DefaultConcurrency,
+            Width = 90,
+            Margin = new Padding(3, 5, 8, 5)
         };
-        var processedIntensity = new CheckBox
-        {
-            AutoSize = true,
-            Checked = true,
-            Enabled = false,
-            Text = "保留 SDK 处理强度（固定）",
-            Margin = new Padding(3, 8, 3, 3)
-        };
-        layout.Controls.Add(rawIntensity, 0, 2);
-        layout.Controls.Add(processedIntensity, 1, 2);
-        layout.SetColumnSpan(processedIntensity, 3);
+        layout.Controls.Add(CreateLabel("同时转换任务数"), 0, 2);
+        layout.Controls.Add(parallelTasksNumeric, 1, 2);
+        var concurrencyHint = CreateLabel("固定保留原始强度与 SDK 处理强度");
+        concurrencyHint.ForeColor = SystemColors.GrayText;
+        layout.Controls.Add(concurrencyHint, 2, 2);
+        layout.SetColumnSpan(concurrencyHint, 2);
 
         var policy = CreateLabel("Y 保存扫描列号；断面间距在正射成图时由小车速度和每秒圈数计算。无回波点通过 rowIndex / columnIndex 保留稀疏结构。");
         policy.ForeColor = SystemColors.GrayText;
