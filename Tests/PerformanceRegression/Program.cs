@@ -8,6 +8,11 @@ using EasyTry.Conversion.Services;
 using EasyTry.Conversion.Sources;
 using EasyTry.Conversion.Writers;
 
+if (args.Length == 2 && args[0] == "--worker-fixture")
+{
+    Environment.Exit(WorkerIsolationChecks.RunFixture(args[1]));
+    return;
+}
 var root = Path.Combine(AppContext.BaseDirectory, "fixtures", Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(root);
 if (args.Length >= 4 && args[0] == "--sdk-smoke")
@@ -27,6 +32,7 @@ var checks = await SchedulerChecks.Run(root);
 checks += await ThreadAffinityChecks.Run(root);
 checks += await WriterChecks.ConcurrentConversions(root);
 checks += WriterChecks.CancellationAndCapacity(root);
+checks += await WorkerIsolationChecks.Run(root);
 Console.WriteLine($"PASS: {checks + 2} performance regression checks; every decoded field of {result.Points:N0} benchmark points matched. Only generated fixtures were converted.");
 
 static class WriterChecks
@@ -249,7 +255,7 @@ sealed class FixtureSource : IScanSource
     {
         cancellationToken.ThrowIfCancellationRequested();
         job = int.Parse(Path.GetFileNameWithoutExtension(options.InputFilePath).Split('-')[1]);
-        Metadata = Metadata with { SourceFilePath = options.InputFilePath };
+        Metadata = Metadata with { SourceFilePath = options.InputFilePath, Vendor = options.Vendor == ScannerVendor.Auto ? ScannerVendor.Faro : options.Vendor };
     }
     public IEnumerable<PointBatch> ReadBatches(int scanLinesPerBatch, CancellationToken cancellationToken)
     {

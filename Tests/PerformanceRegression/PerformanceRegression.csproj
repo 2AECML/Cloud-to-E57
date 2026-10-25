@@ -15,4 +15,7 @@
     <None Include="../../EasyTry/dll/zftools.dll" Link="zftools.dll" CopyToOutputDirectory="PreserveNewest" />
     <None Include="../../EasyTry/dll/zfs.ini" Link="zfs.ini" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+  <Target Name="CopyConversionWorkerHost" AfterTargets="Build">
+    <Copy SourceFiles="../../EasyTry/bin/x64/Release/net8.0-windows-tasklist/EasyTry.exe;../../EasyTry/bin/x64/Release/net8.0-windows-tasklist/EasyTry.runtimeconfig.json;../../EasyTry/bin/x64/Release/net8.0-windows-tasklist/EasyTry.deps.json" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+  </Target>
 </Project>

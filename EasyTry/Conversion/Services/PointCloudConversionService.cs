@@ -14,10 +14,12 @@ public sealed class PointCloudConversionService : IPointCloudConversionService
 
     private readonly Func<ScannerVendor, IScanSource> sourceFactory;
     private readonly Func<IPointCloudWriter> writerFactory;
+    private readonly ConversionWorkerClient? workerClient;
 
     public PointCloudConversionService()
         : this(CreateSource, static () => new NativeE57Writer())
     {
+        workerClient = new ConversionWorkerClient();
     }
 
     public PointCloudConversionService(
@@ -38,6 +40,10 @@ public sealed class PointCloudConversionService : IPointCloudConversionService
         {
             return Task.FromCanceled<ConversionReport>(cancellationToken);
         }
+        if (workerClient is not null)
+        {
+            return workerClient.ConvertAsync(options, progress, cancellationToken);
+        }
         var vendor = options.Vendor == ScannerVendor.Auto
             ? ConversionPrecheckService.DetectVendor(options.InputFilePath)
             : options.Vendor;
@@ -48,6 +54,20 @@ public sealed class PointCloudConversionService : IPointCloudConversionService
         return Task.Run(
             () => ConvertCore(options, progress, cancellationToken),
             cancellationToken);
+    }
+
+    internal static ConversionReport ConvertInWorker(
+        ConversionOptions options,
+        IProgress<ConversionProgress> progress,
+        CancellationToken token)
+    {
+        var service = new PointCloudConversionService(CreateSource, static () => new NativeE57Writer());
+        var vendor = options.Vendor == ScannerVendor.Auto
+            ? ConversionPrecheckService.DetectVendor(options.InputFilePath)
+            : options.Vendor;
+        return vendor == ScannerVendor.Faro
+            ? service.ConvertCore(options, progress, token)
+            : Task.Run(() => service.ConvertCore(options, progress, token), token).GetAwaiter().GetResult();
     }
 
     private Task<ConversionReport> ConvertOnFaroThread(
