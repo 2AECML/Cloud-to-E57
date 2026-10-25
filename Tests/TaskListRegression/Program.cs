@@ -78,7 +78,7 @@ var sameNames = ConversionTaskList.Load(TaskFile("same-names", zfsRoot, otherZfs
 Check(sameNames.Select(o => o.OutputFilePath).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 2,
     "Repeated ZFS names in different directories must not overwrite each other.");
 Check(sameNames[0].OutputFilePath == Build(tasks[1]).Single().OutputFilePath,
-    "Output identities must remain stable for resume journals.");
+    "Output identities must remain stable across repeated imports.");
 Check(ConversionTaskList.Load(TaskFile("direct-fls", faro001)).Single().InputPaths.Single() == faro001,
     "Direct FARO scan-package roots must remain supported.");
 var emptyRoot = Path.Combine(testRoot, "empty");
@@ -105,6 +105,73 @@ Check(orphanOption.InputFilePath == orphan && new ConversionPrecheckService().Ch
     "Existing orphan-volume recovery and its warning must be retained.");
 Check(ConversionTaskList.RemoveTasks(listPath, new[] { tasks[1] }) == 1 && ConversionTaskList.Load(listPath).Count == 1,
     "Completion removal must remove only the selected directory row.");
+
+Exception? completionError = null;
+var completionThread = new Thread(() =>
+{
+    try
+    {
+        var logDirectory = Path.Combine(AppContext.BaseDirectory, "logs");
+        string[] LogFiles() => Directory.Exists(logDirectory)
+            ? Directory.GetFiles(logDirectory, "*", SearchOption.AllDirectories)
+                .Select(path => $"{path}:{File.GetLastWriteTimeUtc(path).Ticks}:{new FileInfo(path).Length}")
+                .OrderBy(path => path).ToArray()
+            : [];
+        var logFilesBefore = LogFiles();
+        using var form = new EasyTry.Conversion.UI.PointCloudConversionForm();
+        var flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+        T Field<T>(string name) => (T)form.GetType().GetField(name, flags)!.GetValue(form)!;
+        IEnumerable<Control> Descendants(Control parent) => parent.Controls.Cast<Control>()
+            .SelectMany(control => new[] { control }.Concat(Descendants(control)));
+        var log = Field<RichTextBox>("logTextBox");
+        Check(log.ReadOnly && Descendants(form).Any(control => control.Text == "运行日志"),
+            "The conversion window must expose a read-only log panel.");
+        var updateProgress = form.GetType().GetMethod("UpdateProgress", flags)!;
+        updateProgress.Invoke(form, new object[] { new ConversionProgress(10, "first stage") });
+        updateProgress.Invoke(form, new object[] { new ConversionProgress(60, "second stage") });
+        Check(log.Text.Contains("first stage") && log.Text.Contains("second stage") &&
+              Field<ProgressBar>("conversionProgressBar").Value == 60,
+            "The log panel must retain prior progress messages while updating current progress.");
+        form.Size = form.MinimumSize;
+        form.PerformLayout();
+        var layout = Field<TableLayoutPanel>("rootLayout");
+        var actions = layout.GetControlFromPosition(0, 3)!;
+        Check(actions.Bottom <= layout.ClientSize.Height - layout.Padding.Bottom,
+            "All conversion actions must fit at the minimum window size.");
+        Check(log.Height >= 40 && log.Parent!.Bottom <= layout.ClientSize.Height - layout.Padding.Bottom,
+            "The log panel must remain readable at the minimum window size.");
+
+        var completionPath = TaskFile("current-run-completion", faroRoot, zfsRoot);
+        var completionTasks = ConversionTaskList.Load(completionPath);
+        Field<List<BatchConversionTask>>("taskListItems").AddRange(completionTasks);
+        form.GetType().GetField("taskListPath", flags)!.SetValue(form, completionPath);
+        Field<CheckBox>("removeCompletedTaskItemsCheckBox").Checked = true;
+        var removeCompleted = form.GetType().GetMethod("TryRemoveCompletedTaskListItems", flags)!;
+        var completedOutputs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var faroOptions = Build(completionTasks[0]);
+        completedOutputs.Add(Path.GetFullPath(faroOptions[0].OutputFilePath));
+        removeCompleted.Invoke(form, new object[] { completedOutputs });
+        Check(ConversionTaskList.Load(completionPath).Count == 2,
+            "A partially completed group must remain in the task list.");
+
+        completedOutputs.Add(Path.GetFullPath(faroOptions[1].OutputFilePath).ToUpperInvariant());
+        removeCompleted.Invoke(form, new object[] { completedOutputs });
+        Check(ConversionTaskList.Load(completionPath).Single().InputRoot == zfsRoot,
+            "Only groups fully completed in the current run may be removed.");
+        Check(!Directory.Exists(Path.Combine(testRoot, "logs")),
+            "Task completion must not create a log directory.");
+        Check(logFilesBefore.SequenceEqual(LogFiles()),
+            "UI logging and task completion must not create or modify log files.");
+    }
+    catch (Exception error)
+    {
+        completionError = error;
+    }
+});
+completionThread.SetApartmentState(ApartmentState.STA);
+completionThread.Start();
+completionThread.Join();
+if (completionError is not null) throw new Exception("Conversion UI completion regression failed.", completionError);
 
 if (args.Length > 0)
 {

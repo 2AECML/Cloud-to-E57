@@ -129,15 +129,6 @@ public static class ConversionTaskList
         }).ToArray();
     }
 
-    public static string GetJournalPath(string taskListPath)
-    {
-        var fullPath = Path.GetFullPath(taskListPath);
-        var logDirectory = Path.Combine(AppContext.BaseDirectory, "logs");
-        Directory.CreateDirectory(logDirectory);
-        return Path.Combine(logDirectory,
-            $"{Path.GetFileNameWithoutExtension(fullPath)}_执行日志.txt");
-    }
-
     public static int RemoveTasks(
         string taskListPath,
         IReadOnlyCollection<BatchConversionTask> tasks)

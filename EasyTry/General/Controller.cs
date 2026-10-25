@@ -128,7 +128,7 @@ namespace EasyTry.General
             {
                 startCmdStr = "scan" + " -profiler" + $" -resolution {ResolutionParam}" + $" -quality {FrequencyParam}" +
                    " -endless" + " -counterbyte" + $" -path {ProjectName}" + $" -file {FileName}" +
-                   " -log" + " -gps" + " -pps" + " -lineheadersize 72" +
+                   " -gps" + " -pps" + " -lineheadersize 72" +
                    $" -filesize {FileSize}mb" + " -cnt1reset" + " -cntlreset" + " -statusstream" +
                    " -cnt1" + " -cnt2" + " -cnt2reset" + rtLine;
             }

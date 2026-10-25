@@ -59,9 +59,9 @@ partial class PointCloudConversionForm
 
         AutoScaleDimensions = new SizeF(9F, 20F);
         AutoScaleMode = AutoScaleMode.Font;
-        ClientSize = new Size(980, 760);
+        ClientSize = new Size(980, 800);
         Controls.Add(rootLayout);
-        MinimumSize = new Size(820, 680);
+        MinimumSize = new Size(820, 840);
         Name = "PointCloudConversionForm";
         StartPosition = FormStartPosition.CenterParent;
         Text = "点云转换（Z+F / FARO → E57）";

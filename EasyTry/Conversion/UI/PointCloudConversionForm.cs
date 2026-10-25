@@ -13,7 +13,6 @@ public partial class PointCloudConversionForm : Form
     private readonly List<BatchConversionTask> taskListItems = [];
     private CancellationTokenSource? cancellationTokenSource;
     private string? taskListPath;
-    private TaskExecutionJournal? executionJournal;
     private bool stoppedForLowDisk;
     private string? lowDiskMessage;
     private DateTime lastDiskSpaceCheck = DateTime.MinValue;
@@ -238,8 +237,6 @@ public partial class PointCloudConversionForm : Form
     {
         if (!RunPrecheck(showDialog: false))
         {
-            MessageBox.Show(this, "预检查未通过，请先修正错误。", "无法开始转换",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
@@ -254,7 +251,6 @@ public partial class PointCloudConversionForm : Form
                 MessageBoxIcon.Warning);
             if (overwriteResult != DialogResult.Yes)
             {
-                AppendLog("用户取消覆盖已有 E57。", LogLevel.Warning);
                 return;
             }
         }
@@ -272,7 +268,10 @@ public partial class PointCloudConversionForm : Form
                 cancellationTokenSource.Token);
             statusLabel.Text = "E57 转换和回读校验完成";
             conversionProgressBar.Value = 100;
+            UpdateCompletedStatistics(report);
             AppendReport(report);
+            MessageBox.Show(this, $"E57 已生成并通过回读校验：{options.OutputFilePath}",
+                "转换完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
         catch (OperationCanceledException)
         {
@@ -345,9 +344,7 @@ public partial class PointCloudConversionForm : Form
         }
 
         statusLabel.Text = $"已选择 {batchInputPaths.Count} 个{ConversionPrecheckService.GetVendorDisplayName(vendor)}输入";
-        AppendLog(
-            $"批量输入已更新：{batchInputPaths.Count} 个{ConversionPrecheckService.GetVendorDisplayName(vendor)}原始扫描。",
-            LogLevel.Information);
+        AppendLog(statusLabel.Text, LogLevel.Information);
     }
 
     private IReadOnlyList<string> SelectZfsScanFiles()
@@ -488,8 +485,6 @@ public partial class PointCloudConversionForm : Form
             taskListItems.Clear();
             taskListItems.AddRange(tasks);
             taskListPath = Path.GetFullPath(dialog.FileName);
-            executionJournal = new TaskExecutionJournal(
-                ConversionTaskList.GetJournalPath(taskListPath));
             batchInputPaths.Clear();
             batchInputPaths.AddRange(tasks.SelectMany(item => item.InputPaths));
             vendorComboBox.SelectedIndex = 0;
@@ -501,13 +496,13 @@ public partial class PointCloudConversionForm : Form
             browseOutputButton.Enabled = false;
             statusLabel.Text = $"已载入任务清单：{tasks.Count} 组，{batchInputPaths.Count} 个扫描任务（自动识别 FARO / Z+F）";
             AppendLog($"已载入任务清单：{taskListPath}", LogLevel.Success);
-            AppendLog($"执行日志：{executionJournal.Path}", LogLevel.Information);
+            AppendLog(statusLabel.Text, LogLevel.Information);
         }
         catch (Exception ex)
         {
+            AppendLog($"任务清单载入失败：{ex.Message}", LogLevel.Error);
             MessageBox.Show(this, ex.Message, "任务清单无效",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            AppendLog($"任务清单载入失败：{ex.Message}", LogLevel.Error);
         }
     }
 
@@ -515,33 +510,18 @@ public partial class PointCloudConversionForm : Form
     {
         taskListItems.Clear();
         taskListPath = null;
-        executionJournal = null;
         outputFileTextBox.ReadOnly = false;
         browseOutputButton.Enabled = true;
     }
 
-    private async void startBatchConversionButton_Click(
-        object? sender,
-        EventArgs e)
+    private async void startBatchConversionButton_Click(object? sender, EventArgs e)
     {
         if (!RunBatchPrecheck(showDialog: false, out var options))
         {
-            MessageBox.Show(
-                this,
-                "批量预检查未通过，请查看运行日志。",
-                "无法开始批量转换",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Warning);
             return;
         }
 
-        var alreadyCompleted = executionJournal?.ReadCompletedKeys()
-            ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var existingOutputs = options.Count(item =>
-            ConversionOutputLayout.OutputExists(item) &&
-            !alreadyCompleted.Contains(TaskExecutionJournal.BuildKey(
-                item.InputFilePath,
-                item.OutputFilePath)));
+        var existingOutputs = options.Count(ConversionOutputLayout.OutputExists);
         if (existingOutputs > 0)
         {
             var overwrite = MessageBox.Show(
@@ -570,42 +550,20 @@ public partial class PointCloudConversionForm : Form
         lastDiskSpaceCheck = DateTime.MinValue;
         SetRunningState(true);
         var succeeded = 0;
-        var skipped = 0;
         var failures = new List<string>();
-        var completedKeys = executionJournal?.ReadCompletedKeys()
-            ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var completedOutputs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         try
         {
             for (var index = 0; index < options.Count; index++)
             {
                 cancellationTokenSource.Token.ThrowIfCancellationRequested();
                 var item = options[index];
-                var itemNumber = index + 1;
-                var journalKey = TaskExecutionJournal.BuildKey(
-                    item.InputFilePath,
-                    item.OutputFilePath);
-                if (completedKeys.Contains(journalKey))
-                {
-                    skipped++;
-                    AppendLog(
-                        $"[{itemNumber}/{options.Count}] 根据执行日志跳过已完成任务（即使下游已清理 E57）：{item.InputFilePath}",
-                        LogLevel.Information);
-                    continue;
-                }
-
-                if (!DiskSpaceGuard.HasSafeFreeSpace(
-                        item.OutputFilePath,
-                        out var freeBytes))
+                if (!DiskSpaceGuard.HasSafeFreeSpace(item.OutputFilePath, out var freeBytes))
                 {
                     stoppedForLowDisk = true;
                     lowDiskMessage =
                         $"输出盘剩余空间 {DiskSpaceGuard.FormatBytes(freeBytes)}，" +
                         $"低于安全余量 {DiskSpaceGuard.FormatBytes(DiskSpaceGuard.MinimumFreeBytes)}。";
-                    executionJournal?.Append(
-                        "STOP_NO_SPACE",
-                        item.InputFilePath,
-                        item.OutputFilePath,
-                        lowDiskMessage);
                     AppendLog(lowDiskMessage + " 自动流程已停止。", LogLevel.Error);
                     break;
                 }
@@ -613,113 +571,75 @@ public partial class PointCloudConversionForm : Form
                 var itemDisplayName = item.ContinuousInputPaths.Count > 0
                     ? ContinuousFaroInputSet.BuildDatasetName(item.ContinuousInputPaths)
                     : Path.GetFileName(item.InputFilePath);
-                AppendLog(
-                    item.ContinuousInputPaths.Count > 0
-                        ? $"[{itemNumber}/{options.Count}] 开始连续合并 {item.ContinuousInputPaths.Count} 个 FARO 输入：{itemDisplayName}"
-                        : $"[{itemNumber}/{options.Count}] 开始转换：{item.InputFilePath}",
-                    LogLevel.Information);
-                executionJournal?.Append(
-                    "START",
-                    item.InputFilePath,
-                    item.OutputFilePath);
+                AppendLog($"[{index + 1}/{options.Count}] 开始转换：{item.InputFilePath}", LogLevel.Information);
                 var progress = new Progress<ConversionProgress>(value =>
                 {
                     MonitorDiskSpace(item);
-                    UpdateBatchProgress(
-                        value,
-                        index,
-                        options.Count,
-                        itemDisplayName);
+                    UpdateBatchProgress(value, index, options.Count, itemDisplayName);
                 });
                 try
                 {
                     var report = await conversionService.ConvertAsync(
-                        item,
-                        progress,
-                        cancellationTokenSource.Token);
+                        item, progress, cancellationTokenSource.Token);
                     succeeded++;
+                    completedOutputs.Add(Path.GetFullPath(item.OutputFilePath));
+                    UpdateCompletedStatistics(report);
                     AppendBatchReport(report, item);
-                    executionJournal?.Append(
-                        "SUCCESS",
-                        item.InputFilePath,
-                        item.OutputFilePath,
-                        "E57 已生成并通过回读校验");
                 }
                 catch (OperationCanceledException)
                 {
-                    if (stoppedForLowDisk)
-                    {
-                        executionJournal?.Append(
-                            "STOP_NO_SPACE",
-                            item.InputFilePath,
-                            item.OutputFilePath,
-                            lowDiskMessage ?? "磁盘空间不足");
-                    }
                     throw;
                 }
                 catch (Exception ex)
                 {
                     failures.Add($"{item.InputFilePath}：{ex.Message}");
-                    executionJournal?.Append(
-                        "FAILED",
-                        item.InputFilePath,
-                        item.OutputFilePath,
-                        ex.Message);
-                    AppendLog(
-                        $"[{itemNumber}/{options.Count}] 转换失败，继续下一项：{ex.Message}",
-                        LogLevel.Error);
+                    AppendLog($"[{index + 1}/{options.Count}] 转换失败，继续下一项：{ex.Message}", LogLevel.Error);
                 }
             }
 
+            statusLabel.Text = stoppedForLowDisk
+                ? $"空间不足，已停止：成功 {succeeded}，失败 {failures.Count}"
+                : $"批量转换完成：成功 {succeeded}，失败 {failures.Count}";
+            if (!stoppedForLowDisk)
+            {
+                conversionProgressBar.Value = 100;
+            }
+            var summary = statusLabel.Text + $"\n输出位置：{outputFileTextBox.Text.Trim()}";
             if (stoppedForLowDisk)
             {
-                statusLabel.Text = $"空间不足，已停止：成功 {succeeded}，跳过 {skipped}，失败 {failures.Count}";
-                AppendLog(
-                    statusLabel.Text + "；释放空间后重新载入同一任务清单即可继续。",
-                    LogLevel.Warning);
-                MessageBox.Show(
-                    this,
-                    $"{statusLabel.Text}\n\n{lowDiskMessage}\n\n释放空间后重新载入同一任务清单即可继续。",
-                    "空间不足，流程已停止",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
-                return;
+                summary += $"\n\n{lowDiskMessage}\n释放空间后可重新选择未完成的任务。";
             }
-
-            conversionProgressBar.Value = 100;
-            statusLabel.Text = $"批量转换完成：成功 {succeeded}，跳过 {skipped}，失败 {failures.Count}";
-            AppendLog(statusLabel.Text, failures.Count == 0
-                ? LogLevel.Success
-                : LogLevel.Warning);
-            MessageBox.Show(
-                this,
-                $"批量转换完成。\n\n成功：{succeeded}\n跳过：{skipped}\n失败：{failures.Count}" +
-                (executionJournal is null ? $"\n输出目录：{outputFileTextBox.Text.Trim()}" : $"\n执行日志：{executionJournal.Path}"),
-                "批量转换结果",
-                MessageBoxButtons.OK,
-                failures.Count == 0
-                    ? MessageBoxIcon.Information
-                    : MessageBoxIcon.Warning);
+            if (failures.Count > 0)
+            {
+                summary += "\n\n失败原因：\n" + string.Join("\n", failures);
+            }
+            AppendLog(statusLabel.Text, stoppedForLowDisk || failures.Count > 0 ? LogLevel.Warning : LogLevel.Success);
+            MessageBox.Show(this, summary, "批量转换结果", MessageBoxButtons.OK,
+                stoppedForLowDisk || failures.Count > 0
+                    ? MessageBoxIcon.Warning
+                    : MessageBoxIcon.Information);
         }
         catch (OperationCanceledException)
         {
             statusLabel.Text = stoppedForLowDisk
                 ? $"空间不足，已安全停止；已成功完成 {succeeded} 项"
                 : $"批量转换已取消；已成功完成 {succeeded} 项";
-            AppendLog(statusLabel.Text, LogLevel.Warning);
+            var summary = statusLabel.Text;
             if (stoppedForLowDisk)
             {
-                MessageBox.Show(
-                    this,
-                    $"{lowDiskMessage}\n\n释放空间后重新载入同一任务清单即可继续。",
-                    "空间不足，流程已停止",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning);
+                summary += $"\n\n{lowDiskMessage}\n释放空间后可重新选择未完成的任务。";
             }
+            if (failures.Count > 0)
+            {
+                summary += "\n\n失败原因：\n" + string.Join("\n", failures);
+            }
+            AppendLog(summary, LogLevel.Warning);
+            MessageBox.Show(this, summary, "批量转换已停止", MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
         }
         finally
         {
-            TryRemoveCompletedTaskListItems();
+            TryRemoveCompletedTaskListItems(completedOutputs);
             SetRunningState(false);
             cancellationTokenSource?.Dispose();
             cancellationTokenSource = null;
@@ -744,7 +664,8 @@ public partial class PointCloudConversionForm : Form
         lowDiskMessage =
             $"输出盘剩余空间 {DiskSpaceGuard.FormatBytes(freeBytes)}，" +
             $"低于安全余量 {DiskSpaceGuard.FormatBytes(DiskSpaceGuard.MinimumFreeBytes)}。";
-        AppendLog(lowDiskMessage + " 正在安全停止当前转换。", LogLevel.Error);
+        statusLabel.Text = lowDiskMessage + " 正在安全停止当前转换。";
+        AppendLog(statusLabel.Text, LogLevel.Error);
         cancellationTokenSource?.Cancel();
     }
 
@@ -759,24 +680,21 @@ public partial class PointCloudConversionForm : Form
         catch (Exception ex)
         {
             options = [];
+            statusLabel.Text = "批量参数错误";
             AppendLog($"批量参数错误：{ex.Message}", LogLevel.Error);
-            if (showDialog)
-            {
-                MessageBox.Show(this, ex.Message, "批量参数错误",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            }
+            MessageBox.Show(this, ex.Message, "批量参数错误",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return false;
         }
 
-        var errorCount = 0;
-        var warningCount = 0;
+        var errors = new List<string>();
+        var warnings = new List<string>();
         var nativeError = NativeE57Writer.GetAvailabilityError();
         if (nativeError is not null)
         {
-            errorCount++;
+            errors.Add(nativeError);
             AppendLog(nativeError, LogLevel.Error);
         }
-
         foreach (var item in options)
         {
             var result = precheckService.Check(item);
@@ -789,26 +707,26 @@ public partial class PointCloudConversionForm : Form
             }
             foreach (var message in result.Warnings)
             {
-                warningCount++;
                 AppendLog($"[{itemName}] {message}", LogLevel.Warning);
             }
             foreach (var message in result.Errors)
             {
-                errorCount++;
                 AppendLog($"[{itemName}] {message}", LogLevel.Error);
             }
+            warnings.AddRange(result.Warnings.Select(message => $"[{itemName}] {message}"));
+            errors.AddRange(result.Errors.Select(message => $"[{itemName}] {message}"));
         }
 
-        var valid = errorCount == 0;
+        var valid = errors.Count == 0;
         statusLabel.Text = valid
-            ? $"批量预检查通过：{options.Count} 项，警告 {warningCount} 项"
-            : $"批量预检查未通过：错误 {errorCount} 项";
+            ? $"批量预检查通过：{options.Count} 项，警告 {warnings.Count} 项"
+            : $"批量预检查未通过：错误 {errors.Count} 项";
         AppendLog(statusLabel.Text, valid ? LogLevel.Success : LogLevel.Error);
-        if (showDialog)
+        if (showDialog || !valid)
         {
-            MessageBox.Show(
-                this,
-                statusLabel.Text,
+            var details = string.Join("\n", errors.Concat(warnings));
+            MessageBox.Show(this,
+                statusLabel.Text + (details.Length > 0 ? "\n\n" + details : ""),
                 valid ? "批量预检查通过" : "批量预检查未通过",
                 MessageBoxButtons.OK,
                 valid ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
@@ -934,24 +852,19 @@ public partial class PointCloudConversionForm : Form
         return options;
     }
 
-    private void TryRemoveCompletedTaskListItems()
+    private void TryRemoveCompletedTaskListItems(IReadOnlySet<string> completedOutputs)
     {
         if (!removeCompletedTaskItemsCheckBox.Checked ||
-            string.IsNullOrWhiteSpace(taskListPath) ||
-            executionJournal is null ||
-            taskListItems.Count == 0)
+            string.IsNullOrWhiteSpace(taskListPath) || taskListItems.Count == 0)
         {
             return;
         }
 
         try
         {
-            var completedKeys = executionJournal.ReadCompletedKeys();
             var completedTasks = taskListItems
                 .Where(task => BuildTaskOptions(task).All(option =>
-                    completedKeys.Contains(TaskExecutionJournal.BuildKey(
-                        option.InputFilePath,
-                        option.OutputFilePath))))
+                    completedOutputs.Contains(Path.GetFullPath(option.OutputFilePath))))
                 .ToArray();
             if (completedTasks.Length == 0) { return; }
 
@@ -960,11 +873,14 @@ public partial class PointCloudConversionForm : Form
             inputFileTextBox.Lines = taskListItems
                 .Select(TaskListDisplayText.FormatTaskPath)
                 .ToArray();
+            statusLabel.Text += $"；已从清单移除 {removed} 个完成项";
             AppendLog($"已从任务清单移除 {removed} 个完成项。", LogLevel.Success);
         }
         catch (Exception ex)
         {
             AppendLog($"从任务清单移除完成项失败：{ex.Message}", LogLevel.Error);
+            MessageBox.Show(this, ex.Message, "从任务清单移除完成项失败",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
 
@@ -987,8 +903,12 @@ public partial class PointCloudConversionForm : Form
         var overall = (completedItemCount * 100 + progress.Percent) /
                       Math.Max(1, totalItemCount);
         conversionProgressBar.Value = Math.Clamp(overall, 0, 100);
-        statusLabel.Text =
-            $"[{completedItemCount + 1}/{totalItemCount}] {inputName}：{progress.Stage}";
+        var message = $"[{completedItemCount + 1}/{totalItemCount}] {inputName}：{progress.Stage}";
+        if (statusLabel.Text != message)
+        {
+            AppendLog(message, LogLevel.Information);
+        }
+        statusLabel.Text = message;
         statisticsLabel.Text = string.Format(
             CultureInfo.CurrentCulture,
             "当前文件扫描线：{0:N0} / {1:N0}；有效点：{2:N0}；跳过无效点：{3:N0}",
@@ -996,42 +916,6 @@ public partial class PointCloudConversionForm : Form
             progress.TotalScanLines,
             progress.ValidPointCount,
             progress.InvalidPointCount);
-    }
-
-    private void AppendBatchReport(
-        ConversionReport report,
-        ConversionOptions options)
-    {
-        var outputPath = ConversionOutputLayout.GetDisplayPath(
-            options,
-            report.ResolvedOutputMode);
-        AppendLog(
-            report.ResolvedOutputMode == E57OutputMode.SegmentedDataset
-                ? $"连续分段 E57 数据集已生成：{outputPath}"
-                : $"E57 已生成并通过回读校验：{outputPath}",
-            LogLevel.Success);
-        AppendLog(
-            $"扫描结构：{report.Metadata.ScanColumns:N0} 条扫描线 × {report.Metadata.ScanRows:N0} 行；" +
-            $"有效点：{report.ValidPointCount:N0}；无效点：{report.InvalidPointCount:N0}；" +
-            $"耗时：{report.Elapsed.TotalSeconds:N2} 秒。",
-            LogLevel.Information);
-        if (report.Metadata.SourceParts is { Count: > 0 } sourceParts)
-        {
-            AppendLog(
-                $"连续 FARO 来源：{sourceParts.Count:N0} 个扫描包；全局列索引 0–{report.Metadata.ScanColumns - 1:N0}。",
-                LogLevel.Information);
-            foreach (var sourcePart in sourceParts)
-            {
-                AppendLog(
-                    $"  [{sourcePart.SourceIndex + 1}/{sourceParts.Count}] " +
-                    $"{Path.GetFileName(sourcePart.SourcePath)}：" +
-                    $"局部 {sourcePart.LocalScanColumns:N0} 列，" +
-                    $"全局列 {sourcePart.EffectiveGlobalColumnStart:N0}–{sourcePart.EffectiveGlobalColumnEnd:N0}",
-                    LogLevel.Information);
-            }
-        }
-        AppendScannerMetadata(report.Metadata);
-        AppendMetadataDocument(report.MetadataDocumentPath);
     }
 
     private static string GetDefaultBatchOutputDirectory(string inputPath)
@@ -1051,8 +935,8 @@ public partial class PointCloudConversionForm : Form
 
         cancelButton.Enabled = false;
         statusLabel.Text = "正在请求取消…";
-        cancellationTokenSource.Cancel();
         AppendLog("已发送取消请求，等待当前批次安全结束。", LogLevel.Warning);
+        cancellationTokenSource.Cancel();
     }
 
     private void PointCloudConversionForm_FormClosing(object? sender, FormClosingEventArgs e)
@@ -1087,13 +971,10 @@ public partial class PointCloudConversionForm : Form
         }
         catch (Exception ex)
         {
+            statusLabel.Text = "参数错误";
             AppendLog($"参数读取失败：{ex.Message}", LogLevel.Error);
-            if (showDialog)
-            {
-                MessageBox.Show(this, ex.Message, "参数错误",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            }
-
+            MessageBox.Show(this, ex.Message, "参数错误",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return false;
         }
 
@@ -1104,7 +985,6 @@ public partial class PointCloudConversionForm : Form
         {
             result.Errors.Add(e57Error);
         }
-
         foreach (var message in result.Information)
         {
             AppendLog(message, LogLevel.Information);
@@ -1117,30 +997,19 @@ public partial class PointCloudConversionForm : Form
         {
             AppendLog(message, LogLevel.Error);
         }
-
-        if (result.IsValid)
+        statusLabel.Text = result.IsValid
+            ? $"基础预检查通过，警告 {result.Warnings.Count} 项"
+            : $"基础预检查未通过，错误 {result.Errors.Count} 项";
+        AppendLog(statusLabel.Text, result.IsValid ? LogLevel.Success : LogLevel.Error);
+        if (showDialog || !result.IsValid)
         {
-            statusLabel.Text = result.Warnings.Count == 0
-                ? "基础预检查通过"
-                : "基础预检查通过（存在警告）";
-            AppendLog("基础预检查通过，真实 E57 写入组件可用。", LogLevel.Success);
-        }
-        else
-        {
-            statusLabel.Text = "基础预检查未通过";
-            AppendLog($"预检查失败，共 {result.Errors.Count} 个错误。", LogLevel.Error);
-        }
-
-        if (showDialog)
-        {
-            var title = result.IsValid ? "预检查通过" : "预检查未通过";
-            var summary = result.IsValid
-                ? $"预检查通过。警告：{result.Warnings.Count} 项。\n\n将流式写入真实 E57，并在完成后回读校验。"
-                : $"基础预检查未通过，错误：{result.Errors.Count} 项。请查看运行日志。";
-            MessageBox.Show(this, summary, title, MessageBoxButtons.OK,
+            var details = string.Join("\n", result.Errors.Concat(result.Warnings));
+            MessageBox.Show(this,
+                statusLabel.Text + (details.Length > 0 ? "\n\n" + details : ""),
+                result.IsValid ? "预检查通过" : "预检查未通过",
+                MessageBoxButtons.OK,
                 result.IsValid ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
         }
-
         return result.IsValid;
     }
 
@@ -1192,12 +1061,17 @@ public partial class PointCloudConversionForm : Form
         {
             conversionProgressBar.Value = 0;
             statusLabel.Text = "正在准备转换…";
+            AppendLog(statusLabel.Text, LogLevel.Information);
         }
     }
 
     private void UpdateProgress(ConversionProgress progress)
     {
         conversionProgressBar.Value = Math.Clamp(progress.Percent, 0, 100);
+        if (statusLabel.Text != progress.Stage)
+        {
+            AppendLog(progress.Stage, LogLevel.Information);
+        }
         statusLabel.Text = progress.Stage;
         statisticsLabel.Text = string.Format(
             CultureInfo.CurrentCulture,
@@ -1206,6 +1080,51 @@ public partial class PointCloudConversionForm : Form
             progress.TotalScanLines,
             progress.ValidPointCount,
             progress.InvalidPointCount);
+    }
+
+    private void UpdateCompletedStatistics(ConversionReport report)
+    {
+        statisticsLabel.Text = string.Format(
+            CultureInfo.CurrentCulture,
+            "已完成扫描线：{0:N0}；有效点：{1:N0}；跳过无效点：{2:N0}；耗时：{3:N2} 秒",
+            report.ProcessedScanLines, report.ValidPointCount,
+            report.InvalidPointCount, report.Elapsed.TotalSeconds);
+    }
+
+    private void AppendBatchReport(
+        ConversionReport report,
+        ConversionOptions options)
+    {
+        var outputPath = ConversionOutputLayout.GetDisplayPath(
+            options,
+            report.ResolvedOutputMode);
+        AppendLog(
+            report.ResolvedOutputMode == E57OutputMode.SegmentedDataset
+                ? $"连续分段 E57 数据集已生成：{outputPath}"
+                : $"E57 已生成并通过回读校验：{outputPath}",
+            LogLevel.Success);
+        AppendLog(
+            $"扫描结构：{report.Metadata.ScanColumns:N0} 条扫描线 × {report.Metadata.ScanRows:N0} 行；" +
+            $"有效点：{report.ValidPointCount:N0}；无效点：{report.InvalidPointCount:N0}；" +
+            $"耗时：{report.Elapsed.TotalSeconds:N2} 秒。",
+            LogLevel.Information);
+        if (report.Metadata.SourceParts is { Count: > 0 } sourceParts)
+        {
+            AppendLog(
+                $"连续 FARO 来源：{sourceParts.Count:N0} 个扫描包；全局列索引 0–{report.Metadata.ScanColumns - 1:N0}。",
+                LogLevel.Information);
+            foreach (var sourcePart in sourceParts)
+            {
+                AppendLog(
+                    $"  [{sourcePart.SourceIndex + 1}/{sourceParts.Count}] " +
+                    $"{Path.GetFileName(sourcePart.SourcePath)}：" +
+                    $"局部 {sourcePart.LocalScanColumns:N0} 列，" +
+                    $"全局列 {sourcePart.EffectiveGlobalColumnStart:N0}–{sourcePart.EffectiveGlobalColumnEnd:N0}",
+                    LogLevel.Information);
+            }
+        }
+        AppendScannerMetadata(report.Metadata);
+        AppendMetadataDocument(report.MetadataDocumentPath);
     }
 
     private void AppendReport(ConversionReport report)
@@ -1284,7 +1203,6 @@ public partial class PointCloudConversionForm : Form
         logTextBox.AppendText($"[{DateTime.Now:HH:mm:ss}] [{prefix}] {message}{Environment.NewLine}");
         logTextBox.SelectionStart = logTextBox.TextLength;
         logTextBox.ScrollToCaret();
-        executionJournal?.Append($"UI_{prefix}", "", "", message);
     }
 
     private static T GetSelectedValue<T>(ComboBox comboBox, T defaultValue) =>
