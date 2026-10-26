@@ -15,9 +15,6 @@ public readonly record struct E57ValidationResult(
 public sealed class NativeE57Writer : IPointCloudWriter
 {
     private const int ScanLinesPerBatch = 64;
-    // libE57Format's E57XmlParser initializes/terminates global Xerces state.
-    // Its readers explicitly do not support simultaneous initialization.
-    private static readonly object ValidationLock = new();
     private IntPtr handle;
     private string? temporaryPath;
     private string? outputPath;
@@ -53,23 +50,20 @@ public sealed class NativeE57Writer : IPointCloudWriter
     public static E57ValidationResult ValidateFile(string filePath, bool readAllPoints)
     {
         var fullPath = Path.GetFullPath(filePath);
-        lock (ValidationLock)
+        if (NativeE57Methods.easytry_e57_validate(
+                fullPath,
+                readAllPoints ? 1 : 0,
+                out var pointCount,
+                out var fieldMask) == 0)
         {
-            if (NativeE57Methods.easytry_e57_validate(
-                    fullPath,
-                    readAllPoints ? 1 : 0,
-                    out var pointCount,
-                    out var fieldMask) == 0)
-            {
-                throw CreateNativeException("E57 回读校验失败");
-            }
-
-            return new E57ValidationResult(
-                pointCount,
-                fieldMask,
-                (fieldMask & NativeE57Methods.RequiredFieldMask) ==
-                NativeE57Methods.RequiredFieldMask);
+            throw CreateNativeException("E57 回读校验失败");
         }
+
+        return new E57ValidationResult(
+            pointCount,
+            fieldMask,
+            (fieldMask & NativeE57Methods.RequiredFieldMask) ==
+            NativeE57Methods.RequiredFieldMask);
     }
 
     public void Open(ScanMetadata metadata, ConversionOptions options)

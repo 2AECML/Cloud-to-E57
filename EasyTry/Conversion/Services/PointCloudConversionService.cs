@@ -14,12 +14,10 @@ public sealed class PointCloudConversionService : IPointCloudConversionService
 
     private readonly Func<ScannerVendor, IScanSource> sourceFactory;
     private readonly Func<IPointCloudWriter> writerFactory;
-    private readonly ConversionWorkerClient? workerClient;
 
     public PointCloudConversionService()
         : this(CreateSource, static () => new NativeE57Writer())
     {
-        workerClient = new ConversionWorkerClient();
     }
 
     public PointCloudConversionService(
@@ -36,74 +34,9 @@ public sealed class PointCloudConversionService : IPointCloudConversionService
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(options);
-        if (cancellationToken.IsCancellationRequested)
-        {
-            return Task.FromCanceled<ConversionReport>(cancellationToken);
-        }
-        if (workerClient is not null)
-        {
-            return workerClient.ConvertAsync(options, progress, cancellationToken);
-        }
-        var vendor = options.Vendor == ScannerVendor.Auto
-            ? ConversionPrecheckService.DetectVendor(options.InputFilePath)
-            : options.Vendor;
-        if (vendor == ScannerVendor.Faro)
-        {
-            return ConvertOnFaroThread(options, progress, cancellationToken);
-        }
         return Task.Run(
             () => ConvertCore(options, progress, cancellationToken),
             cancellationToken);
-    }
-
-    internal static ConversionReport ConvertInWorker(
-        ConversionOptions options,
-        IProgress<ConversionProgress> progress,
-        CancellationToken token)
-    {
-        var service = new PointCloudConversionService(CreateSource, static () => new NativeE57Writer());
-        var vendor = options.Vendor == ScannerVendor.Auto
-            ? ConversionPrecheckService.DetectVendor(options.InputFilePath)
-            : options.Vendor;
-        return vendor == ScannerVendor.Faro
-            ? service.ConvertCore(options, progress, token)
-            : Task.Run(() => service.ConvertCore(options, progress, token), token).GetAwaiter().GetResult();
-    }
-
-    private Task<ConversionReport> ConvertOnFaroThread(
-        ConversionOptions options,
-        IProgress<ConversionProgress>? progress,
-        CancellationToken cancellationToken)
-    {
-        // FARO's in-process COM server is registered as Apartment. Creating it
-        // on an MTA pool thread routes calls through COM's shared host STA:
-        // loading the next scan can then block other tasks' point reads.
-        // Keep construction, reads and disposal on this task's own STA.
-        var completion = new TaskCompletionSource<ConversionReport>(
-            TaskCreationOptions.RunContinuationsAsynchronously);
-        var worker = new Thread(() =>
-        {
-            try
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                completion.TrySetResult(ConvertCore(options, progress, cancellationToken));
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                completion.TrySetCanceled(cancellationToken);
-            }
-            catch (Exception error)
-            {
-                completion.TrySetException(error);
-            }
-        })
-        {
-            IsBackground = true,
-            Name = "FARO conversion"
-        };
-        worker.SetApartmentState(ApartmentState.STA);
-        worker.Start();
-        return completion.Task;
     }
 
     private ConversionReport ConvertCore(

@@ -15,9 +15,8 @@ public partial class PointCloudConversionForm : Form
     private string? taskListPath;
     private bool stoppedForLowDisk;
     private string? lowDiskMessage;
-    private readonly Dictionary<string, DateTime> lastDiskSpaceChecks = new(StringComparer.OrdinalIgnoreCase);
+    private DateTime lastDiskSpaceCheck = DateTime.MinValue;
     private bool conversionRunning;
-    private bool closeAfterConversion;
 
     public PointCloudConversionForm()
         : this(new PointCloudConversionService())
@@ -298,7 +297,6 @@ public partial class PointCloudConversionForm : Form
             SetRunningState(false);
             cancellationTokenSource?.Dispose();
             cancellationTokenSource = null;
-            if (closeAfterConversion) { Close(); }
         }
     }
 
@@ -549,78 +547,55 @@ public partial class PointCloudConversionForm : Form
         cancellationTokenSource = new CancellationTokenSource();
         stoppedForLowDisk = false;
         lowDiskMessage = null;
-        lastDiskSpaceChecks.Clear();
+        lastDiskSpaceCheck = DateTime.MinValue;
         SetRunningState(true);
         var succeeded = 0;
         var failures = new List<string>();
         var completedOutputs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var runCancellation = cancellationTokenSource;
-        var itemProgress = new ConversionProgress?[options.Count];
-        var itemFinished = new bool[options.Count];
-        var itemActive = new bool[options.Count];
-        var itemStages = new string?[options.Count];
-        var concurrency = decimal.ToInt32(parallelTasksNumeric.Value);
-
-        void RefreshBatchProgress() => UpdateBatchProgress(
-            itemProgress, itemFinished, itemActive.Count(active => active));
-
-        async Task ConvertItem(int index, ConversionOptions item, CancellationToken token)
-        {
-            token.ThrowIfCancellationRequested();
-            itemActive[index] = true;
-            var itemDisplayName = item.ContinuousInputPaths.Count > 0
-                ? ContinuousFaroInputSet.BuildDatasetName(item.ContinuousInputPaths)
-                : Path.GetFileName(item.InputFilePath);
-            try
-            {
-                MonitorDiskSpace(item, forceCheck: true);
-                token.ThrowIfCancellationRequested();
-                AppendLog($"[{index + 1}/{options.Count}] 开始转换：{item.InputFilePath}", LogLevel.Information);
-                RefreshBatchProgress();
-                var progress = new Progress<ConversionProgress>(value =>
-                {
-                    if (!conversionRunning || !ReferenceEquals(cancellationTokenSource, runCancellation) ||
-                        itemFinished[index] || !itemActive[index])
-                    {
-                        return;
-                    }
-                    MonitorDiskSpace(item);
-                    itemProgress[index] = value;
-                    if (itemStages[index] != value.Stage)
-                    {
-                        itemStages[index] = value.Stage;
-                        AppendLog($"[{index + 1}/{options.Count}] {itemDisplayName}：{value.Stage}", LogLevel.Information);
-                    }
-                    RefreshBatchProgress();
-                });
-                var report = await conversionService.ConvertAsync(item, progress, token);
-                succeeded++;
-                completedOutputs.Add(Path.GetFullPath(item.OutputFilePath));
-                itemProgress[index] = new ConversionProgress(100, "已完成",
-                    report.ProcessedScanLines, report.Metadata.ScanColumns,
-                    report.ValidPointCount, report.InvalidPointCount);
-                itemFinished[index] = true;
-                AppendBatchReport(report, item);
-            }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception ex)
-            {
-                failures.Add($"{item.InputFilePath}：{ex.Message}");
-                itemFinished[index] = true;
-                AppendLog($"[{index + 1}/{options.Count}] 转换失败，继续下一项：{ex.Message}", LogLevel.Error);
-            }
-            finally
-            {
-                itemActive[index] = false;
-                RefreshBatchProgress();
-            }
-        }
-
         try
         {
-            AppendLog($"本批共 {options.Count} 项，最多同时转换 {concurrency} 个独立任务。", LogLevel.Information);
-            await new BatchConversionScheduler().RunAsync(
-                options, concurrency, ConvertItem, runCancellation.Token);
+            for (var index = 0; index < options.Count; index++)
+            {
+                cancellationTokenSource.Token.ThrowIfCancellationRequested();
+                var item = options[index];
+                if (!DiskSpaceGuard.HasSafeFreeSpace(item.OutputFilePath, out var freeBytes))
+                {
+                    stoppedForLowDisk = true;
+                    lowDiskMessage =
+                        $"输出盘剩余空间 {DiskSpaceGuard.FormatBytes(freeBytes)}，" +
+                        $"低于安全余量 {DiskSpaceGuard.FormatBytes(DiskSpaceGuard.MinimumFreeBytes)}。";
+                    AppendLog(lowDiskMessage + " 自动流程已停止。", LogLevel.Error);
+                    break;
+                }
+
+                var itemDisplayName = item.ContinuousInputPaths.Count > 0
+                    ? ContinuousFaroInputSet.BuildDatasetName(item.ContinuousInputPaths)
+                    : Path.GetFileName(item.InputFilePath);
+                AppendLog($"[{index + 1}/{options.Count}] 开始转换：{item.InputFilePath}", LogLevel.Information);
+                var progress = new Progress<ConversionProgress>(value =>
+                {
+                    MonitorDiskSpace(item);
+                    UpdateBatchProgress(value, index, options.Count, itemDisplayName);
+                });
+                try
+                {
+                    var report = await conversionService.ConvertAsync(
+                        item, progress, cancellationTokenSource.Token);
+                    succeeded++;
+                    completedOutputs.Add(Path.GetFullPath(item.OutputFilePath));
+                    UpdateCompletedStatistics(report);
+                    AppendBatchReport(report, item);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    failures.Add($"{item.InputFilePath}：{ex.Message}");
+                    AppendLog($"[{index + 1}/{options.Count}] 转换失败，继续下一项：{ex.Message}", LogLevel.Error);
+                }
+            }
 
             statusLabel.Text = stoppedForLowDisk
                 ? $"空间不足，已停止：成功 {succeeded}，失败 {failures.Count}"
@@ -668,20 +643,18 @@ public partial class PointCloudConversionForm : Form
             SetRunningState(false);
             cancellationTokenSource?.Dispose();
             cancellationTokenSource = null;
-            if (closeAfterConversion) { Close(); }
         }
     }
 
-    private void MonitorDiskSpace(ConversionOptions item, bool forceCheck = false)
+    private void MonitorDiskSpace(ConversionOptions item)
     {
-        var root = Path.GetPathRoot(Path.GetFullPath(item.OutputFilePath))!;
-        if (stoppedForLowDisk || (!forceCheck && lastDiskSpaceChecks.TryGetValue(root, out var lastCheck) &&
-            DateTime.UtcNow - lastCheck < TimeSpan.FromSeconds(2)))
+        if (stoppedForLowDisk ||
+            DateTime.UtcNow - lastDiskSpaceCheck < TimeSpan.FromSeconds(2))
         {
             return;
         }
 
-        lastDiskSpaceChecks[root] = DateTime.UtcNow;
+        lastDiskSpaceCheck = DateTime.UtcNow;
         if (DiskSpaceGuard.HasSafeFreeSpace(item.OutputFilePath, out var freeBytes))
         {
             return;
@@ -922,29 +895,27 @@ public partial class PointCloudConversionForm : Form
     }
 
     private void UpdateBatchProgress(
-        IReadOnlyList<ConversionProgress?> progress,
-        IReadOnlyList<bool> finished,
-        int activeCount)
+        ConversionProgress progress,
+        int completedItemCount,
+        int totalItemCount,
+        string inputName)
     {
-        long totalPercent = 0;
-        long processedLines = 0, validPoints = 0, invalidPoints = 0;
-        for (var index = 0; index < progress.Count; index++)
+        var overall = (completedItemCount * 100 + progress.Percent) /
+                      Math.Max(1, totalItemCount);
+        conversionProgressBar.Value = Math.Clamp(overall, 0, 100);
+        var message = $"[{completedItemCount + 1}/{totalItemCount}] {inputName}：{progress.Stage}";
+        if (statusLabel.Text != message)
         {
-            var item = progress[index];
-            totalPercent += finished[index] ? 100 : Math.Clamp(item?.Percent ?? 0, 0, 100);
-            processedLines += item?.ProcessedScanLines ?? 0;
-            validPoints += item?.ValidPointCount ?? 0;
-            invalidPoints += item?.InvalidPointCount ?? 0;
+            AppendLog(message, LogLevel.Information);
         }
-        conversionProgressBar.Value = (int)(totalPercent / Math.Max(1, progress.Count));
-        if (cancellationTokenSource?.IsCancellationRequested != true)
-        {
-            statusLabel.Text = $"已结束 {finished.Count(done => done)} / {progress.Count} 项；正在转换 {activeCount} 项";
-        }
+        statusLabel.Text = message;
         statisticsLabel.Text = string.Format(
             CultureInfo.CurrentCulture,
-            "本批已处理扫描线：{0:N0}；有效点：{1:N0}；跳过无效点：{2:N0}",
-            processedLines, validPoints, invalidPoints);
+            "当前文件扫描线：{0:N0} / {1:N0}；有效点：{2:N0}；跳过无效点：{3:N0}",
+            progress.ProcessedScanLines,
+            progress.TotalScanLines,
+            progress.ValidPointCount,
+            progress.InvalidPointCount);
     }
 
     private static string GetDefaultBatchOutputDirectory(string inputPath)
@@ -975,9 +946,6 @@ public partial class PointCloudConversionForm : Form
             return;
         }
 
-        e.Cancel = true;
-        if (closeAfterConversion) { return; }
-
         var result = MessageBox.Show(
             this,
             "转换任务正在运行。是否取消任务并关闭页面？",
@@ -987,10 +955,10 @@ public partial class PointCloudConversionForm : Form
 
         if (result != DialogResult.Yes)
         {
+            e.Cancel = true;
             return;
         }
 
-        closeAfterConversion = true;
         cancellationTokenSource?.Cancel();
     }
 

@@ -141,28 +141,6 @@ var completionThread = new Thread(() =>
         Check(log.Height >= 40 && log.Parent!.Bottom <= layout.ClientSize.Height - layout.Padding.Bottom,
             "The log panel must remain readable at the minimum window size.");
 
-        var parallelTasks = Field<NumericUpDown>("parallelTasksNumeric");
-        Check(parallelTasks.Value == 2 && parallelTasks.Minimum == 1 && parallelTasks.Maximum == 4,
-            "The conversion UI must default to two tasks and limit concurrency to 1–4.");
-        var setRunning = form.GetType().GetMethod("SetRunningState", flags)!;
-        setRunning.Invoke(form, new object[] { true });
-        Check(!parallelTasks.Enabled, "Concurrency must not change while a batch is running.");
-        setRunning.Invoke(form, new object[] { false });
-        var batchProgress = new ConversionProgress?[]
-        {
-            new(50, "file A", 10, 20, 100, 2),
-            new(25, "file B", 5, 20, 50, 1), null
-        };
-        var updateBatch = form.GetType().GetMethod("UpdateBatchProgress", flags)!;
-        updateBatch.Invoke(form, new object[] { batchProgress, new[] { false, false, false }, 2 });
-        Check(Field<ProgressBar>("conversionProgressBar").Value == 25 &&
-              Field<Label>("statusLabel").Text.Contains("正在转换 2 项") &&
-              Field<Label>("statisticsLabel").Text.Contains("150"),
-            "Parallel progress must include both active tasks and pending work without overwriting their totals.");
-        updateBatch.Invoke(form, new object[] { batchProgress, new[] { true, false, false }, 1 });
-        Check(Field<ProgressBar>("conversionProgressBar").Value == 41,
-            "A settled task must contribute its full share of batch progress.");
-
         var completionPath = TaskFile("current-run-completion", faroRoot, zfsRoot);
         var completionTasks = ConversionTaskList.Load(completionPath);
         Field<List<BatchConversionTask>>("taskListItems").AddRange(completionTasks);
